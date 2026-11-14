@@ -1,18 +1,21 @@
-"""Team Outerstellar - Harmonized Burning Activity Calendar (prototype).  Run: streamlit run app.py"""
+"""Team Outerstellar - Harmonized Burning Activity Calendar.  Run: streamlit run app.py"""
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
 from plotly.subplots import make_subplots
 
-from analytics import MONTH_NAMES, add_baseline_and_anomaly, aggregate_region, estimate_factor
-from generate_mock_data import GRID_CSV, main as build_data
+from analytics import (MONTH_NAMES, add_baseline_and_anomaly, aggregate_region, brief, harmonize,
+                       peak_month, top_anomalies, validation_stats)
+from generate_mock_data import GRID_CSV, main as build_mock_data
 
+REAL_CSV = Path("data/grid_monthly_real.csv")  # created by build_grid_from_firms.py
 st.set_page_config(page_title="Harmonized Burning Activity Calendar", page_icon="🔥", layout="wide")
 
-PRESETS = {  # name: (lat_min, lat_max, lon_min, lon_max)
-    "Whole Southeast Asia (mock domain)": (-10.0, 24.0, 93.0, 127.0),
+PRESETS = {  # name: (lat_min, lat_max, lon_min, lon_max); "Entire dataset" is filled in from the data
+    "Entire dataset": None,
     "Mainland SE Asia (TH/LA/MM/VN/KH)": (8.0, 24.0, 93.0, 110.0),
     "Sumatra": (-6.0, 6.0, 94.0, 109.0),
     "Kalimantan (Borneo)": (-4.5, 4.5, 108.0, 119.0),
@@ -23,33 +26,56 @@ FLAG_COLORS = {"high": "#d62728", "low": "#1f77b4", "normal": "#9aa0a6"}
 
 # ---------- data ----------
 @st.cache_data(show_spinner="Loading gridded hotspot data...")
-def load_grid() -> pd.DataFrame:
+def load_grid():
+    """Real FIRMS-derived grid if present, otherwise the mock grid (built on first run)."""
+    if REAL_CSV.exists():
+        return pd.read_csv(REAL_CSV), False
     if not GRID_CSV.exists():
-        build_data()  # writes data/mock_grid_monthly.csv
-    return pd.read_csv(GRID_CSV)
+        build_mock_data()
+    return pd.read_csv(GRID_CSV), True
+
+
+def year_range_slider(label, years, default=None, container=st.sidebar):
+    lo, hi = int(years.min()), int(years.max())
+    if lo == hi:
+        container.caption(f"{label}: {lo} (only year available)")
+        return lo, hi
+    d = default or (lo, hi)
+    d = (max(lo, d[0]), min(hi, d[1]))
+    if d[0] >= d[1]:
+        d = (lo, hi)
+    return container.slider(label, lo, hi, d)
 
 
 # ---------- sidebar ----------
-def sidebar_controls(years):
+def sidebar_controls(grid):
+    years = grid.year.drop_duplicates()
+    ext = (float(np.floor(grid.cell_lat.min() - 1)), float(np.ceil(grid.cell_lat.max() + 1)),
+           float(np.floor(grid.cell_lon.min() - 1)), float(np.ceil(grid.cell_lon.max() + 1)))
     st.sidebar.header("1. Region of interest")
     preset = st.sidebar.selectbox("Preset", list(PRESETS))
-    d = PRESETS[preset] or PRESETS["Whole Southeast Asia (mock domain)"]
+    d = PRESETS[preset] or ext
     custom = preset == "Custom"
     c1, c2 = st.sidebar.columns(2)
-    k = preset  # new widget keys per preset so values reset when the preset changes
-    lat_min = c1.number_input("Lat min", -11.0, 25.0, d[0], 0.5, key=f"a{k}", disabled=not custom)
-    lat_max = c2.number_input("Lat max", -11.0, 25.0, d[1], 0.5, key=f"b{k}", disabled=not custom)
-    lon_min = c1.number_input("Lon min", 92.0, 128.0, d[2], 0.5, key=f"c{k}", disabled=not custom)
-    lon_max = c2.number_input("Lon max", 92.0, 128.0, d[3], 0.5, key=f"d{k}", disabled=not custom)
+    kk = f"{preset}"
+    lat_min = c1.number_input("Lat min", ext[0], ext[1], d[0], 0.5, key=f"a{kk}", disabled=not custom)
+    lat_max = c2.number_input("Lat max", ext[0], ext[1], d[1], 0.5, key=f"b{kk}", disabled=not custom)
+    lon_min = c1.number_input("Lon min", ext[2], ext[3], d[2], 0.5, key=f"c{kk}", disabled=not custom)
+    lon_max = c2.number_input("Lon max", ext[2], ext[3], d[3], 0.5, key=f"d{kk}", disabled=not custom)
 
-    st.sidebar.header("2. Baseline & selection")
-    b0, b1 = st.sidebar.slider("Baseline years (historical median)", int(years.min()), int(years.max()),
-                               (2001, 2020))
+    st.sidebar.header("2. Harmonization")
+    method = st.sidebar.radio("Cross-sensor factor", ["global", "seasonal"], horizontal=True,
+                              help="global: one VIIRS/MODIS factor. seasonal: a factor per calendar month.")
+
+    st.sidebar.header("3. Baseline & selection")
+    base = year_range_slider("Baseline years (historical median)", years, (2001, 2020))
+    latest = int(years.max())
     sel_year = st.sidebar.selectbox("Year", sorted(years, reverse=True))
-    sel_month = st.sidebar.selectbox("Month", range(1, 13), index=9, format_func=lambda m: MONTH_NAMES[m - 1])
-    y0, y1 = st.sidebar.slider("Calendar year range", int(years.min()), int(years.max()),
-                               (int(years.min()), int(years.max())))
-    return (lat_min, lat_max, lon_min, lon_max), (b0, b1), (sel_year, sel_month), (y0, y1)
+    last_m = int(grid[grid.year == latest].month.max())
+    sel_month = st.sidebar.selectbox("Month", range(1, 13), index=last_m - 1,
+                                     format_func=lambda m: MONTH_NAMES[m - 1])
+    yr = year_range_slider("Calendar year range", years)
+    return preset, (lat_min, lat_max, lon_min, lon_max), method, base, (sel_year, sel_month), yr
 
 
 # ---------- charts ----------
@@ -87,7 +113,7 @@ def month_across_years(df, month, sel_year):
                                        for f, y in zip(m.anomaly_flag, m.year)]))
     fig.add_trace(go.Scatter(x=m.year, y=m.baseline_historical_median, mode="lines", name="Baseline median",
                              line=dict(color="black", dash="dash")))
-    fig.update_layout(title=f"{MONTH_NAMES[month - 1]} hotspots by year (selected year outlined by flag colour)",
+    fig.update_layout(title=f"{MONTH_NAMES[month - 1]} hotspots by year (selected year coloured by flag)",
                       xaxis_title="Year", yaxis_title="Harmonized hotspots", height=420,
                       legend=dict(orientation="h", y=-0.2))
     return fig
@@ -97,12 +123,13 @@ def year_vs_baseline(df, year):
     y = df[df.year == year].sort_values("month")
     base = df.drop_duplicates("month").sort_values("month")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=MONTH_NAMES, y=base.baseline_q3, line=dict(width=0), showlegend=False,
+    fig.add_trace(go.Scatter(x=[MONTH_NAMES[m - 1] for m in base.month], y=base.baseline_q3,
+                             line=dict(width=0), showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=[MONTH_NAMES[m - 1] for m in base.month], y=base.baseline_q1, fill="tonexty",
+                             line=dict(width=0), fillcolor="rgba(120,120,120,.2)", name="Baseline IQR",
                              hoverinfo="skip"))
-    fig.add_trace(go.Scatter(x=MONTH_NAMES, y=base.baseline_q1, fill="tonexty", line=dict(width=0),
-                             fillcolor="rgba(120,120,120,.2)", name="Baseline IQR", hoverinfo="skip"))
-    fig.add_trace(go.Scatter(x=MONTH_NAMES, y=base.baseline_historical_median, name="Baseline median",
-                             line=dict(color="black", dash="dash")))
+    fig.add_trace(go.Scatter(x=[MONTH_NAMES[m - 1] for m in base.month], y=base.baseline_historical_median,
+                             name="Baseline median", line=dict(color="black", dash="dash")))
     fig.add_trace(go.Scatter(x=[MONTH_NAMES[m - 1] for m in y.month], y=y.hotspot_count, name=str(year),
                              mode="lines+markers", line=dict(color="#d62728"),
                              marker=dict(color=[FLAG_COLORS[f] for f in y.anomaly_flag], size=9)))
@@ -112,7 +139,6 @@ def year_vs_baseline(df, year):
 
 
 def harmonization_chart(df):
-    """Top: raw MODIS vs raw VIIRS (different scales). Bottom: harmonized single series."""
     x = pd.to_datetime(dict(year=df.year, month=df.month, day=1))
     v = df.viirs_raw.where(df.viirs_raw > 0)
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
@@ -121,7 +147,10 @@ def harmonization_chart(df):
     fig.add_trace(go.Scatter(x=x, y=df.modis_raw, name="MODIS raw (1 km)", line=dict(color="#e67e22")), 1, 1)
     fig.add_trace(go.Scatter(x=x, y=v, name="VIIRS raw (375 m)", line=dict(color="#8e44ad")), 1, 1)
     fig.add_trace(go.Scatter(x=x, y=df.hotspot_count, name="Harmonized", line=dict(color="#c0392b")), 2, 1)
-    fig.add_vline(x=pd.Timestamp("2012-01-01"), line_dash="dot", line_color="gray")
+    if (df.viirs_raw > 0).any():
+        first = df[df.viirs_raw > 0].iloc[0]
+        fig.add_vline(x=pd.Timestamp(year=int(first.year), month=int(first.month), day=1),
+                      line_dash="dot", line_color="gray")
     fig.update_layout(height=560, legend=dict(orientation="h", y=-0.12), margin=dict(t=60))
     fig.update_yaxes(title_text="Hotspots", row=1, col=1)
     fig.update_yaxes(title_text="Hotspots", row=2, col=1)
@@ -131,12 +160,13 @@ def harmonization_chart(df):
 def region_map(grid, bbox, year, month):
     lat0, lat1, lon0, lon1 = bbox
     c = grid[(grid.year == year) & (grid.month == month)
-             & grid.cell_lat.between(lat0, lat1) & grid.cell_lon.between(lon0, lon1)]
+             & grid.cell_lat.between(lat0, lat1) & grid.cell_lon.between(lon0, lon1)].copy()
+    c["val"] = np.where(c.viirs_raw > 0, c.viirs_raw / max(c.viirs_raw.sum() / max(c.modis_raw.sum(), 1), 1e-9),
+                        c.modis_raw)
     fig = go.Figure(go.Scattergeo(
         lat=c.cell_lat, lon=c.cell_lon, mode="markers",
-        marker=dict(size=np.clip(c.hotspot_count * 1.2 + 4, 4, 40), color=c.hotspot_count,
-                    colorscale="YlOrRd", showscale=True, colorbar=dict(title="Hotspots"),
-                    line=dict(width=0.3, color="black")),
+        marker=dict(size=np.clip(c.val * 1.2 + 4, 4, 40), color=c.val, colorscale="YlOrRd", showscale=True,
+                    colorbar=dict(title="Hotspots"), line=dict(width=0.3, color="black")),
         hovertemplate="%{lat}, %{lon}<br>%{marker.color:.1f} hotspots<extra></extra>"))
     fig.update_geos(lataxis_range=[lat0 - 1, lat1 + 1], lonaxis_range=[lon0 - 1, lon1 + 1],
                     showland=True, landcolor="#2b2b2b", showocean=True, oceancolor="#1a2a3a",
@@ -148,18 +178,22 @@ def region_map(grid, bbox, year, month):
 # ---------- main ----------
 def main():
     st.title("🔥 Harmonized Burning Activity Calendar")
-    st.caption("Team Outerstellar · NASA Space Apps · MODIS (1 km, 2000→) + VIIRS (375 m, 2012→) "
-               "harmonized to MODIS-equivalent counts · **MOCK DATA**")
+    grid, is_mock = load_grid()
+    st.caption("Team Outerstellar · NASA Space Apps · MODIS (1 km, 2000→) + VIIRS (375 m, 2012→) harmonized "
+               "to MODIS-equivalent counts · " + ("**MOCK DATA**" if is_mock else "**NASA FIRMS data**"))
+    if is_mock:
+        st.warning("Demo mode: showing simulated data. Run `build_grid_from_firms.py` on FIRMS archive "
+                   "downloads to switch to real detections.")
 
-    grid = load_grid()
-    bbox, (b0, b1), (sel_year, sel_month), (y0, y1) = sidebar_controls(grid.year.drop_duplicates())
-
-    monthly = aggregate_region(grid, *bbox)
-    if monthly.empty:
+    preset, bbox, method, (b0, b1), (sel_year, sel_month), (y0, y1) = sidebar_controls(grid)
+    monthly_raw = aggregate_region(grid, *bbox)
+    if monthly_raw.empty:
         st.warning("No grid cells inside that bounding box (cells are 2°). Enlarge the box.")
         return
-    full = add_baseline_and_anomaly(monthly, b0, b1)
+    harmonized = harmonize(monthly_raw, method)
+    full = add_baseline_and_anomaly(harmonized, b0, b1)
     view = full[full.year.between(y0, y1)]
+    peak = peak_month(full)
 
     row = full[(full.year == sel_year) & (full.month == sel_month)]
     if not row.empty:
@@ -169,9 +203,12 @@ def main():
         m2.metric("Baseline median", f"{r.baseline_historical_median:,.0f}")
         m3.metric("vs median", f"{r.ratio_to_median}x" if pd.notna(r.ratio_to_median) else "n/a")
         m4.metric("Anomaly", r.anomaly_flag.capitalize())
+        if pd.notna(r.ratio_to_median):
+            label = preset if preset not in ("Custom", "Entire dataset") else "the selected region"
+            st.info("**Situation brief:** " + brief(r, label, peak))
         st.caption(f"Sensor source for this month: {r.sensor_source}")
     else:
-        st.info("No data for the selected month (the record starts Nov 2000).")
+        st.info("No data for the selected month.")
 
     st.subheader("Burning activity calendar")
     mode = st.radio("Colour by", ["Hotspot count", "Anomaly vs baseline (ratio to median)"], horizontal=True)
@@ -183,28 +220,44 @@ def main():
     t2.plotly_chart(year_vs_baseline(full, sel_year), width="stretch")
 
     st.subheader("Why harmonize? MODIS vs VIIRS")
-    k = estimate_factor(monthly)
-    if k:
-        st.caption(f"Over the overlap period (2012→) VIIRS reports about **{k:.1f}x** more detections than MODIS "
-                   f"in this region (finer 375 m pixels). Dividing VIIRS by k removes the artificial jump in 2012.")
+    v = validation_stats(harmonized)
+    if v:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Overlap months", v["months"])
+        c2.metric("VIIRS / MODIS factor k", f"{v['k']:.2f}")
+        c3.metric("Cross-sensor correlation (log)", f"{v['r']:.2f}")
+        c4.metric("Median error after harmonizing",
+                  f"{v['median_pct_error']:.0f}%" if pd.notna(v["median_pct_error"]) else "n/a")
+        st.caption("Validation over the months where both sensors report: high correlation and a low error mean "
+                   "the harmonized series is consistent across the 2012 sensor transition.")
+    else:
+        st.caption("Not enough overlapping MODIS/VIIRS months in this region to validate the harmonization.")
     st.plotly_chart(harmonization_chart(view), width="stretch")
 
-    st.subheader(f"Map: {MONTH_NAMES[sel_month - 1]} {sel_year} hotspot intensity by 2° cell")
+    st.subheader("Most unusual months in this region")
+    top = top_anomalies(full)
+    st.dataframe(top, width="stretch", hide_index=True) if len(top) else st.caption("No high anomalies found.")
+
+    st.subheader(f"Map: {MONTH_NAMES[sel_month - 1]} {sel_year} intensity by 2° cell")
     st.plotly_chart(region_map(grid, bbox, sel_year, sel_month), width="stretch")
 
     st.subheader("Export")
     out = view.assign(lat_min=bbox[0], lat_max=bbox[1], lon_min=bbox[2], lon_max=bbox[3],
-                      baseline_start=b0, baseline_end=b1)
+                      baseline_start=b0, baseline_end=b1, harmonization=method)
     st.download_button("⬇️ Download filtered results (CSV)", out.to_csv(index=False).encode("utf-8"),
                        file_name=f"burning_calendar_{y0}-{y1}.csv", mime="text/csv")
     with st.expander("Preview table"):
         st.dataframe(out, width="stretch")
-    with st.expander("Harmonization method"):
-        st.markdown("- **2000–2011:** MODIS counts as-is.\n"
-                    "- **2012→:** VIIRS counts ÷ *k*, where *k* = Σ VIIRS / Σ MODIS over the overlap period "
-                    "(~5.8 in the mock data; ~5.8 in the NRT sample files too).\n"
-                    "- **Baseline:** per-calendar-month median and IQR over the chosen baseline years; "
-                    "a month is flagged *high/low* beyond 1.5×IQR from Q3/Q1.")
+    with st.expander("Method, assumptions and limitations"):
+        st.markdown(
+            "- **Pre-VIIRS:** MODIS counts as-is. **From the first VIIRS month:** VIIRS ÷ *k*, with *k* = Σ VIIRS / "
+            "Σ MODIS over the overlap (*global*) or per calendar month (*seasonal*).\n"
+            "- **Baseline:** per-calendar-month median and IQR over the chosen baseline years; a month is flagged "
+            "*high/low* beyond 1.5×IQR from Q3/Q1.\n"
+            "- **Consistency:** one satellite per sensor family (Terra MODIS, Suomi-NPP VIIRS) and low-confidence "
+            "detections removed, so the record has no hidden steps.\n"
+            "- **Limits:** counts are detections, not burned area; cloud/smoke and overpass time affect detection; "
+            "a hotspot count ratio (*k*) assumes similar fire sizes between sensors.")
 
 
 if __name__ == "__main__":
