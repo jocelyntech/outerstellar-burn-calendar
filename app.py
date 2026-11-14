@@ -236,7 +236,10 @@ def main():
 
     st.subheader("Most unusual months in this region")
     top = top_anomalies(full)
-    st.dataframe(top, width="stretch", hide_index=True) if len(top) else st.caption("No high anomalies found.")
+    if len(top):
+        st.dataframe(top, width="stretch", hide_index=True)
+    else:
+        st.caption("No high anomalies found.")
 
     st.subheader(f"Map: {MONTH_NAMES[sel_month - 1]} {sel_year} intensity by 2° cell")
     st.plotly_chart(region_map(grid, bbox, sel_year, sel_month), width="stretch")
