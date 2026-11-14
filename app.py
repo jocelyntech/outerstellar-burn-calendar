@@ -7,22 +7,27 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from analytics import (MONTH_NAMES, add_uncertainty, aggregate_region, analyze, annual_trend, brief, harmonize,
-                       loyo_error, loyo_error_levels, peak_month, terra_scale_error, top_anomalies,
-                       validation_stats)
+from analytics import (MONTH_NAMES, add_uncertainty, aggregate_region, analyze, annual_trend, attach_coverage,
+                       brief, harmonize, loyo_error, loyo_error_by_size, loyo_error_levels, peak_month,
+                       terra_scale_error, top_anomalies, validation_stats)
 from generate_mock_data import GRID_CSV, main as build_mock_data
 
 REAL_CSV = Path("data/grid_monthly_real.csv")  # created by build_grid_from_firms.py
+COVERAGE_CSV = Path("data/coverage.csv")        # same script: share of days each satellite reported
 st.set_page_config(page_title="Harmonized Burning Activity Calendar", page_icon="🔥", layout="wide")
 
-PRESETS = {  # name: (lat_min, lat_max, lon_min, lon_max); "Entire dataset" is filled in from the data
-    "Entire dataset": None,
-    "Peninsular Malaysia": (1.0, 7.0, 99.0, 105.0),
-    "Sabah and Sarawak (Borneo)": (0.5, 7.5, 108.5, 119.5),
-    "Mainland SE Asia (TH/LA/MM/VN/KH)": (8.0, 24.0, 93.0, 110.0),
-    "Sumatra": (-6.0, 6.0, 94.0, 109.0),
-    "Kalimantan (Borneo)": (-4.5, 4.5, 108.0, 119.0),
-    "Custom": None,
+PRESETS = {  # name: ((lat_min, lat_max, lon_min, lon_max) or None = whole data extent, country or None)
+    "Entire dataset": (None, None),
+    "Malaysia (all)": (None, "Malaysia"),
+    "Indonesia (all)": (None, "Indonesia"),
+    "Peninsular Malaysia": ((1.0, 7.0, 99.0, 105.0), "Malaysia"),
+    "Sabah and Sarawak (Borneo)": ((0.5, 7.5, 108.5, 119.5), "Malaysia"),
+    "Sumatra": ((-6.0, 6.0, 94.0, 109.0), "Indonesia"),
+    "Kalimantan (Borneo)": ((-4.5, 4.5, 108.0, 119.0), "Indonesia"),
+    "Java": ((-9.0, -5.5, 105.0, 115.0), "Indonesia"),
+    "Papua": ((-10.0, 0.5, 130.0, 141.5), "Indonesia"),
+    "Mainland SE Asia (TH/LA/MM/VN/KH)": ((8.0, 24.0, 93.0, 110.0), None),
+    "Custom": (None, None),
 }
 FLAG_COLORS = {"extreme": "#7f0000", "high": "#d62728", "low": "#1f77b4", "normal": "#9aa0a6",
                "no baseline": "#d9d9d9"}
@@ -68,12 +73,21 @@ def sidebar_controls(grid):
     ext = (float(np.floor(grid.cell_lat.min() - 1)), float(np.ceil(grid.cell_lat.max() + 1)),
            float(np.floor(grid.cell_lon.min() - 1)), float(np.ceil(grid.cell_lon.max() + 1)))
     st.sidebar.header("1. Region of interest")
-    def covered(box):  # preset box must lie inside the data extent and contain data
-        return box is None or (box[0] >= ext[0] and box[1] <= ext[1] and box[2] >= ext[2]
-                               and box[3] <= ext[3] and len(aggregate_region(grid, *box)) > 0)
-    options = [p for p, box in PRESETS.items() if covered(box)]
+    countries = sorted(grid.country.unique()) if "country" in grid.columns else []
+
+    def covered(item):  # preset box must lie inside the data extent and contain data
+        box, ctry = item
+        if ctry and countries and ctry not in countries:
+            return False
+        if ctry and not countries:
+            ctry = None  # grid without country labels (mock data): ignore the country part
+        if box is None:
+            return True
+        return (box[0] >= ext[0] and box[1] <= ext[1] and box[2] >= ext[2] and box[3] <= ext[3]
+                and len(aggregate_region(grid, *box, ctry)) > 0)
+    options = [p for p, item in PRESETS.items() if covered(item)]
     qp = st.query_params
-    hidden = [p for p, b in PRESETS.items() if b and p not in options]
+    hidden = [p for p, (b, _) in PRESETS.items() if b and p not in options]
     if hidden:
         st.sidebar.caption("Not covered by the loaded data: " + ", ".join(hidden))
     # stable widget identity: set the initial value once via session_state (a changing `index=` made
@@ -81,7 +95,8 @@ def sidebar_controls(grid):
     if st.session_state.get("preset") not in options:
         st.session_state["preset"] = qp.get("preset") if qp.get("preset") in options else options[0]
     preset = st.sidebar.selectbox("Preset", options, key="preset")
-    d = PRESETS[preset] or ext
+    box, country = PRESETS[preset]
+    d = box or ext
     custom = preset == "Custom"
     c1, c2 = st.sidebar.columns(2)
     kk = f"{preset}"
@@ -90,6 +105,10 @@ def sidebar_controls(grid):
     lon_min = c1.number_input("Lon min", ext[2], ext[3], d[2], 0.5, key=f"c{kk}", disabled=not custom)
     lon_max = c2.number_input("Lon max", ext[2], ext[3], d[3], 0.5, key=f"d{kk}", disabled=not custom)
 
+    if custom and countries:
+        country = st.sidebar.selectbox("Country", ["All"] + countries)
+    if country == "All" or not countries:
+        country = None
     st.sidebar.header("2. Harmonization")
     if st.session_state.get("method") not in ("global", "seasonal"):
         st.session_state["method"] = qp.get("method") if qp.get("method") in ("global", "seasonal") else "seasonal"
@@ -115,7 +134,7 @@ def sidebar_controls(grid):
     sel_month = st.sidebar.selectbox("Month", range(1, 13), index=last_m - 1,
                                      format_func=lambda m: MONTH_NAMES[m - 1])
     yr = year_range_slider("Calendar year range", years)
-    return preset, (lat_min, lat_max, lon_min, lon_max), method, scale, (bmode.lower(), base, window), (sel_year, sel_month), yr
+    return preset, (lat_min, lat_max, lon_min, lon_max, country), method, scale, (bmode.lower(), base, window), (sel_year, sel_month), yr
 
 
 # ---------- charts ----------
@@ -244,7 +263,9 @@ def main():
 
     preset, bbox, method, scale, (bmode, (b0, b1), window), (sel_year, sel_month), (y0, y1) = sidebar_controls(grid)
     st.query_params.update(preset=preset, method=method)
-    monthly_raw = aggregate_region(grid, *bbox)
+    bbox, country = bbox[:4], bbox[4]
+    gview = grid if not country else grid[grid.country == country]
+    monthly_raw = aggregate_region(grid, *bbox, country)
     if monthly_raw.empty:
         st.warning(f"No grid cells inside that bounding box (cells are {cell_size(grid):g}°). Enlarge the box.")
         return
@@ -252,9 +273,15 @@ def main():
     med_err, p80_err = loyo_error(harmonized, method)
     err_ta = terra_scale_error(harmonized)
     levels = loyo_error_levels(harmonized, method)
+    by_size = loyo_error_by_size(harmonized, method)
     harmonized = add_uncertainty(harmonized, 0 if np.isnan(med_err) else med_err,
                                  0 if np.isnan(err_ta) else err_ta)
+    has_cov = (not is_mock) and COVERAGE_CSV.exists()
+    if has_cov:
+        harmonized = attach_coverage(harmonized, pd.read_csv(COVERAGE_CSV))
     full = analyze(harmonized, bmode, b0, b1, window, scale)
+    if has_cov:  # a flag in a month with missing satellite days is never "robust"
+        full["robust"] = full.robust & ~full.data_gap
     base_desc = (f"the same month in the previous {window} years (needs at least 7)" if bmode == "rolling"
                  else f"the same month in {b0}-{b1}")
     # partial-month guard: the current UTC month is incomplete, so never flag it
@@ -277,6 +304,9 @@ def main():
             label = preset if preset not in ("Custom", "Entire dataset") else "the selected region"
             st.info("**Situation brief:** " + brief(r, label, peak))
         st.caption(f"Sensor source for this month: {r.sensor_source} · Baseline = {base_desc}")
+        if has_cov and bool(r.data_gap):
+            st.warning(f"Data gap: the satellite(s) behind this month reported on only {r.coverage:.0%} of days, "
+                       "so the count is probably too low. Treat any flag for this month with caution.")
     else:
         st.info("No data for the selected month.")
 
@@ -310,13 +340,22 @@ def main():
         c4.metric("Out-of-sample error (leave-one-year-out)",
                   f"{med_err:.0%}" if pd.notna(med_err) else "n/a", help=f"80% of months within {p80_err:.0%}")
         lv = " · ".join(f"{k} {v:.0%}" for k, v in levels.items())
+        size_txt = " · ".join(f"{k} hotspots: {v:.0%}" for k, v in by_size.items())
         st.caption("Validation over the months where both sensors report (leave-one-year-out). "
+                   + (f"Error by month size: {size_txt} (quiet months are noisy). " if size_txt else "") +
                    f"Median error by time scale: {lv}; random counting noise averages out in longer totals."
                    + (f" Terra-only months before Aqua (Nov 2000-Jun 2002) are scaled to Terra+Aqua with "
                       f"≈{err_ta:.0%} error." if pd.notna(err_ta) else ""))
     else:
         st.caption("Not enough overlapping MODIS/VIIRS months in this region to validate the harmonization.")
     st.plotly_chart(harmonization_chart(view), width="stretch")
+
+    if has_cov:
+        gaps = harmonized[harmonized.data_gap][["year", "month", "sensor_source", "coverage"]]
+        with st.expander(f"Data-quality notes: {len(gaps)} months in this region with missing satellite days"):
+            st.caption("Share of calendar days on which the satellite(s) behind the month reported any detection "
+                       "(whole-dataset check). Low values are likely outages or partial months, not real changes.")
+            st.dataframe(gaps.sort_values("coverage"), width="stretch", hide_index=True)
 
     st.subheader("Most unusual months in this region")
     top = top_anomalies(full)
@@ -328,14 +367,14 @@ def main():
     st.subheader(f"Map: {MONTH_NAMES[sel_month - 1]} {sel_year} intensity by {cell_size(grid):g}° cell")
     k_sel = row.iloc[0].k_used if not row.empty else np.nan
     t_sel = row.iloc[0].terra_scale if not row.empty else np.nan
-    st.plotly_chart(region_map(grid, bbox, sel_year, sel_month, k_sel, t_sel), width="stretch")
+    st.plotly_chart(region_map(gview, bbox, sel_year, sel_month, k_sel, t_sel), width="stretch")
 
     st.subheader("Export")
     if not row.empty and pd.notna(row.iloc[0].ratio_to_median):
         st.download_button("📄 One-page situation brief (Markdown)", ("# Burning activity brief\n\n" + brief(row.iloc[0], preset, peak)
                            + f"\n\n_Harmonization error ≈ ±{med_err:.0%} (leave-one-year-out). Source: NASA FIRMS MODIS + VIIRS._").encode(),
                            file_name=f"brief_{sel_year}-{sel_month:02d}.md")
-    out = view.assign(lat_min=bbox[0], lat_max=bbox[1], lon_min=bbox[2], lon_max=bbox[3],
+    out = view.assign(country=country or "All", lat_min=bbox[0], lat_max=bbox[1], lon_min=bbox[2], lon_max=bbox[3],
                       baseline_start=b0, baseline_end=b1, harmonization=method)
     st.download_button("⬇️ Download filtered results (CSV)", out.to_csv(index=False).encode("utf-8"),
                        file_name=f"burning_calendar_{y0}-{y1}.csv", mime="text/csv")

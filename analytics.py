@@ -6,9 +6,12 @@ MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
-def aggregate_region(grid: pd.DataFrame, lat_min, lat_max, lon_min, lon_max) -> pd.DataFrame:
-    """Sum RAW MODIS and VIIRS counts of all grid cells whose centre lies in the bbox."""
-    sel = grid[grid.cell_lat.between(lat_min, lat_max) & grid.cell_lon.between(lon_min, lon_max)]
+def aggregate_region(grid: pd.DataFrame, lat_min, lat_max, lon_min, lon_max, country=None) -> pd.DataFrame:
+    """Sum RAW counts of all grid cells whose centre lies in the bbox (optionally only one source country)."""
+    sel = grid
+    if country and country != "All" and "country" in grid.columns:
+        sel = sel[sel.country == country]
+    sel = sel[sel.cell_lat.between(lat_min, lat_max) & sel.cell_lon.between(lon_min, lon_max)]
     if sel.empty:
         return pd.DataFrame(columns=["year", "month", "modis_raw", "viirs_raw"])
     cols = [c for c in ("modis_raw", "viirs_raw", "modis_terra", "modis_aqua") if c in sel.columns]
@@ -50,11 +53,13 @@ def harmonize(monthly: pd.DataFrame, method: str = "global") -> pd.DataFrame:
     modis_label = np.where(df.terra_scale.notna(), "MODIS Terra (scaled to Terra+Aqua)",
                            "MODIS Terra+Aqua" if "modis_aqua" in df.columns and (df.modis_aqua > 0).any() else "MODIS")
     if not has_v.any():
+        df["viirs_era"] = False
         df["k_used"] = np.nan
         df["sensor_source"] = modis_label
         df["hotspot_count"] = df.modis_raw.astype(float).round(1)
         return df
-    era = idx >= idx[has_v].min()
+    era = idx >= idx[has_v].min() + 1   # first VIIRS month is partial (S-NPP data starts 20 Jan 2012): keep MODIS there
+    df["viirs_era"] = era
     ov = df[era & (df.modis_raw > 0)]
     k_global = ov.viirs_raw.sum() / ov.modis_raw.sum() if len(ov) else np.nan
     k = pd.Series(k_global, index=df.index)
@@ -67,9 +72,15 @@ def harmonize(monthly: pd.DataFrame, method: str = "global") -> pd.DataFrame:
     return df
 
 
+def _overlap(df):
+    """Months where both sensors report and VIIRS is in its full-month era."""
+    m = (df.viirs_raw > 0) & (df.modis_raw > 0)
+    return df[m & df.viirs_era] if "viirs_era" in df.columns else df[m]
+
+
 def validation_stats(df: pd.DataFrame):
     """Cross-sensor agreement over the overlap period (None if there is no overlap)."""
-    ov = df[(df.viirs_raw > 0) & (df.modis_raw > 0)]
+    ov = _overlap(df)
     if len(ov) < 6:
         return None
     r = float(np.corrcoef(np.log1p(ov.modis_raw), np.log1p(ov.viirs_raw))[0, 1])
@@ -112,7 +123,9 @@ def peak_month(df: pd.DataFrame):
 
 def top_anomalies(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
     hi = df[df.severity.isin(["high", "extreme"])].sort_values("ratio_to_median", ascending=False).head(n)
-    return hi[["year", "month", "hotspot_count", "hotspot_lo", "hotspot_hi", "baseline_historical_median", "ratio_to_median", "severity", "robust"]]
+    cols = ["year", "month", "hotspot_count", "hotspot_lo", "hotspot_hi", "baseline_historical_median",
+            "ratio_to_median", "severity", "robust"]
+    return hi[cols + (["coverage"] if "coverage" in hi.columns else [])]
 
 
 def brief(row, region_label: str, peak: int, month_names=MONTH_NAMES) -> str:
@@ -138,7 +151,7 @@ def brief(row, region_label: str, peak: int, month_names=MONTH_NAMES) -> str:
 def loyo_error(df, method="seasonal", min_modis=5):
     """Leave-one-year-out error of VIIRS/k vs the MODIS record on overlap months.
     Returns (median, p80) relative error as fractions."""
-    ov = df[(df.viirs_raw > 0) & (df.modis_raw > 0)]
+    ov = _overlap(df)
     errs = []
     for y, te in ov.groupby("year"):
         tr = ov[ov.year != y]
@@ -180,7 +193,7 @@ def terra_scale_error(df, min_count=5):
 
 def loyo_error_levels(df, method="seasonal", min_modis=5):
     """Leave-one-year-out median error of VIIRS/k vs MODIS for monthly, quarterly and annual totals."""
-    ov = df[(df.viirs_raw > 0) & (df.modis_raw > 0)].copy()
+    ov = _overlap(df).copy()
     parts = []
     for y, te in ov.groupby("year"):
         tr = ov[ov.year != y]
@@ -285,3 +298,41 @@ def annual_trend(df):
         return a, None
     slope = np.polyfit(a.index.to_numpy(float), a.to_numpy(), 1)[0]
     return a, float(slope / a.mean() * 100)
+
+
+def loyo_error_by_size(df, method="seasonal"):
+    """Leave-one-year-out median error split by how many MODIS hotspots the month has (counting noise matters)."""
+    ov = _overlap(df)
+    parts = []
+    for y, te in ov.groupby("year"):
+        tr = ov[ov.year != y]
+        k = tr.viirs_raw.sum() / tr.modis_raw.sum()
+        if method == "seasonal":
+            s = tr.groupby("month")[["viirs_raw", "modis_raw"]].sum()
+            k = te.month.map(s.viirs_raw / s.modis_raw).fillna(k)
+        parts.append(te.assign(rel=(te.viirs_raw / k - te.modis_raw).abs() / te.modis_raw))
+    if not parts:
+        return {}
+    p = pd.concat(parts)
+    out = {}
+    for name, lo, hi in (("<20", 1, 20), ("20-99", 20, 100), (">=100", 100, 1e12)):
+        x = p[(p.modis_raw >= lo) & (p.modis_raw < hi)].rel
+        if len(x) >= 5:
+            out[name] = float(x.median())
+    return out
+
+
+def attach_coverage(df, cov, threshold=0.9):
+    """Add `coverage` (share of days with any detection for the sensor(s) behind each month) and `data_gap`."""
+    c = cov.pivot_table(index=["year", "month"], columns="sensor", values="coverage").reset_index()
+    d = df.merge(c, on=["year", "month"], how="left")
+    for s in ("terra", "aqua", "viirs"):
+        if s not in d:
+            d[s] = np.nan
+    src = d.sensor_source.astype(str)
+    used = np.where(src.str.startswith("VIIRS"), d.viirs,
+                    np.where(src.str.startswith("MODIS Terra ("), d.terra, np.fmin(d.terra, d.aqua)))
+    d = d.drop(columns=["terra", "aqua", "viirs"])
+    d["coverage"] = used
+    d["data_gap"] = d.coverage < threshold
+    return d
