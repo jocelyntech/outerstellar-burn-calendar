@@ -16,6 +16,8 @@ st.set_page_config(page_title="Harmonized Burning Activity Calendar", page_icon=
 
 PRESETS = {  # name: (lat_min, lat_max, lon_min, lon_max); "Entire dataset" is filled in from the data
     "Entire dataset": None,
+    "Peninsular Malaysia": (1.0, 7.0, 99.0, 105.0),
+    "Sabah & Sarawak (Borneo)": (0.5, 7.5, 108.5, 119.5),
     "Mainland SE Asia (TH/LA/MM/VN/KH)": (8.0, 24.0, 93.0, 110.0),
     "Sumatra": (-6.0, 6.0, 94.0, 109.0),
     "Kalimantan (Borneo)": (-4.5, 4.5, 108.0, 119.0),
@@ -33,6 +35,12 @@ def load_grid():
     if not GRID_CSV.exists():
         build_mock_data()
     return pd.read_csv(GRID_CSV), True
+
+
+def cell_size(grid):
+    """Grid cell size in degrees, inferred from the data."""
+    diffs = np.diff(np.sort(grid.cell_lat.unique()))
+    return float(diffs[diffs > 1e-9].min()) if len(diffs[diffs > 1e-9]) else 1.0
 
 
 def year_range_slider(label, years, default=None, container=st.sidebar):
@@ -53,7 +61,11 @@ def sidebar_controls(grid):
     ext = (float(np.floor(grid.cell_lat.min() - 1)), float(np.ceil(grid.cell_lat.max() + 1)),
            float(np.floor(grid.cell_lon.min() - 1)), float(np.ceil(grid.cell_lon.max() + 1)))
     st.sidebar.header("1. Region of interest")
-    preset = st.sidebar.selectbox("Preset", list(PRESETS))
+    def covered(box):  # preset box must lie inside the data extent and contain data
+        return box is None or (box[0] >= ext[0] and box[1] <= ext[1] and box[2] >= ext[2]
+                               and box[3] <= ext[3] and len(aggregate_region(grid, *box)) > 0)
+    options = [p for p, box in PRESETS.items() if covered(box)]
+    preset = st.sidebar.selectbox("Preset", options)
     d = PRESETS[preset] or ext
     custom = preset == "Custom"
     c1, c2 = st.sidebar.columns(2)
@@ -157,12 +169,11 @@ def harmonization_chart(df):
     return fig
 
 
-def region_map(grid, bbox, year, month):
+def region_map(grid, bbox, year, month, k):
     lat0, lat1, lon0, lon1 = bbox
     c = grid[(grid.year == year) & (grid.month == month)
              & grid.cell_lat.between(lat0, lat1) & grid.cell_lon.between(lon0, lon1)].copy()
-    c["val"] = np.where(c.viirs_raw > 0, c.viirs_raw / max(c.viirs_raw.sum() / max(c.modis_raw.sum(), 1), 1e-9),
-                        c.modis_raw)
+    c["val"] = c.viirs_raw / k if pd.notna(k) else c.modis_raw  # MODIS-equivalent counts
     fig = go.Figure(go.Scattergeo(
         lat=c.cell_lat, lon=c.cell_lon, mode="markers",
         marker=dict(size=np.clip(c.val * 1.2 + 4, 4, 40), color=c.val, colorscale="YlOrRd", showscale=True,
@@ -188,7 +199,7 @@ def main():
     preset, bbox, method, (b0, b1), (sel_year, sel_month), (y0, y1) = sidebar_controls(grid)
     monthly_raw = aggregate_region(grid, *bbox)
     if monthly_raw.empty:
-        st.warning("No grid cells inside that bounding box (cells are 2°). Enlarge the box.")
+        st.warning(f"No grid cells inside that bounding box (cells are {cell_size(grid):g}°). Enlarge the box.")
         return
     harmonized = harmonize(monthly_raw, method)
     full = add_baseline_and_anomaly(harmonized, b0, b1)
@@ -241,8 +252,9 @@ def main():
     else:
         st.caption("No high anomalies found.")
 
-    st.subheader(f"Map: {MONTH_NAMES[sel_month - 1]} {sel_year} intensity by 2° cell")
-    st.plotly_chart(region_map(grid, bbox, sel_year, sel_month), width="stretch")
+    st.subheader(f"Map: {MONTH_NAMES[sel_month - 1]} {sel_year} intensity by {cell_size(grid):g}° cell")
+    k_sel = row.iloc[0].k_used if not row.empty else np.nan
+    st.plotly_chart(region_map(grid, bbox, sel_year, sel_month, k_sel), width="stretch")
 
     st.subheader("Export")
     out = view.assign(lat_min=bbox[0], lat_max=bbox[1], lon_min=bbox[2], lon_max=bbox[3],
