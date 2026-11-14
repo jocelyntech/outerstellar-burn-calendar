@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from analytics import (MONTH_NAMES, add_uncertainty, aggregate_region, analyze, annual_trend, attach_coverage,
+from burn_analytics import (MONTH_NAMES, add_uncertainty, aggregate_region, analyze, annual_trend, attach_coverage,
                        brief, harmonize, loyo_error, loyo_error_by_size, loyo_error_levels, peak_month,
                        terra_scale_error, top_anomalies, validation_stats)
 from generate_mock_data import GRID_CSV, main as build_mock_data

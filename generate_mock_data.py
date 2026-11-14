@@ -13,7 +13,7 @@ Run:  python generate_mock_data.py
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from analytics import add_baseline_and_anomaly
+from burn_analytics import add_baseline_and_anomaly
 
 DATA_DIR = Path("data")
 GRID_CSV = DATA_DIR / "mock_grid_monthly.csv"
