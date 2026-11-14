@@ -5,7 +5,7 @@ Usage:
 Output: data/grid_monthly_real.csv  (the app uses it automatically instead of the mock data)
 
 Consistency choices (important for a harmonized record):
-  * MODIS : Terra only ('T') by default -> Terra runs since 2000; Aqua only from mid-2002 would add a step.
+  * MODIS : Terra only ('T' / 'Terra') by default -> Terra runs since 2000; Aqua only from mid-2002 would add a step.
   * VIIRS : Suomi-NPP only ('N') by default -> runs since 2012; NOAA-20/21 would add extra detections later.
   * Low-confidence detections are dropped (MODIS confidence < 30, VIIRS 'l'/'low').
 Use --modis-sat all / --viirs-sat all to keep every satellite.
@@ -22,8 +22,15 @@ OUT = Path("data/grid_monthly_real.csv")
 def load(files, kind, sat):
     frames = [pd.read_csv(f, dtype={"satellite": str, "confidence": str}) for f in files]
     d = pd.concat(frames, ignore_index=True)
+    d = d.drop_duplicates(subset=["latitude", "longitude", "acq_date", "acq_time", "satellite"])
     if sat != "all":
-        d = d[d.satellite.str.upper() == sat.upper()]
+        s_ = d.satellite.str.strip().str.upper()
+        # MODIS archive says 'Terra'/'Aqua', NRT says 'T'/'A' -> match first letter.
+        # VIIRS: exact match ('N' = Suomi-NPP, 'N20', 'N21'); archive may also say 'NPP'/'SNPP'.
+        if kind == "modis":
+            d = d[s_.str[0] == sat.upper()[0]]
+        else:
+            d = d[s_.isin({sat.upper()} | ({"N", "NPP", "SNPP", "SUOMI-NPP"} if sat.upper() == "N" else set()))]
     conf = d.confidence.str.lower()
     if kind == "modis":
         d = d[pd.to_numeric(conf, errors="coerce") >= 30]
