@@ -5,21 +5,23 @@ Usage:
 Output: data/grid_monthly_real.csv  (the app uses it automatically instead of the mock data)
 
 Consistency choices (important for a harmonized record):
-  * MODIS : Terra only ('T' / 'Terra') by default -> Terra runs since 2000; Aqua only from mid-2002 would add a step.
+  * MODIS : Terra and Aqua are counted separately (columns modis_terra, modis_aqua; modis_raw = their sum).
+            Aqua only exists from July 2002, so the app scales the Terra-only months before that to
+            Terra+Aqua-equivalent. VIIRS agrees much better with Terra+Aqua than with Terra alone.
   * VIIRS : Suomi-NPP only ('N') by default -> runs since 2012; NOAA-20/21 would add extra detections later.
   * Low-confidence detections are dropped (MODIS confidence < 30, VIIRS 'l'/'low').
-Use --modis-sat all / --viirs-sat all to keep every satellite.
+Use --modis-sat T / --viirs-sat all to restrict or widen the satellites.
 """
 import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
 
-CELL = 2.0
+CELL = 1.0   # grid cell size in degrees (override with --cell)
 OUT = Path("data/grid_monthly_real.csv")
 
 
-def load(files, kind, sat):
+def load(files, kind, sat, cell=CELL):
     frames = [pd.read_csv(f, dtype={"satellite": str, "confidence": str}) for f in files]
     d = pd.concat(frames, ignore_index=True)
     d = d.drop_duplicates(subset=["latitude", "longitude", "acq_date", "acq_time", "satellite"])
@@ -37,30 +39,41 @@ def load(files, kind, sat):
     else:
         d = d[~conf.isin(["l", "low"])]
     dt = pd.to_datetime(d.acq_date)
-    return pd.DataFrame({"year": dt.dt.year, "month": dt.dt.month,
-                         "cell_lat": np.floor(d.latitude / CELL) * CELL + CELL / 2,
-                         "cell_lon": np.floor(d.longitude / CELL) * CELL + CELL / 2})
+    return pd.DataFrame({"year": dt.dt.year, "month": dt.dt.month, "sat": d.satellite.str.strip().str.upper().str[0],
+                         "cell_lat": np.floor(d.latitude / cell) * cell + cell / 2,
+                         "cell_lon": np.floor(d.longitude / cell) * cell + cell / 2})
 
 
 def count(df, name):
     return df.groupby(["year", "month", "cell_lat", "cell_lon"]).size().rename(name).reset_index()
 
 
+def count_modis(df):
+    """Per-cell monthly MODIS counts, Terra and Aqua kept apart."""
+    c = (df.groupby(["year", "month", "cell_lat", "cell_lon", "sat"]).size()
+           .unstack("sat", fill_value=0).reindex(columns=["T", "A"], fill_value=0)
+           .rename(columns={"T": "modis_terra", "A": "modis_aqua"}).reset_index())
+    c["modis_raw"] = c.modis_terra + c.modis_aqua
+    return c
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--modis", nargs="+", required=True)
     ap.add_argument("--viirs", nargs="+", required=True)
-    ap.add_argument("--modis-sat", default="T")
+    ap.add_argument("--modis-sat", default="all")
     ap.add_argument("--viirs-sat", default="N")
+    ap.add_argument("--cell", type=float, default=CELL, help="grid cell size in degrees")
     a = ap.parse_args()
-    m = count(load(a.modis, "modis", a.modis_sat), "modis_raw")
-    v = count(load(a.viirs, "viirs", a.viirs_sat), "viirs_raw")
+    m = count_modis(load(a.modis, "modis", a.modis_sat, a.cell))
+    v = count(load(a.viirs, "viirs", a.viirs_sat, a.cell), "viirs_raw")
     g = m.merge(v, how="outer", on=["year", "month", "cell_lat", "cell_lon"]).fillna(0)
-    g[["modis_raw", "viirs_raw"]] = g[["modis_raw", "viirs_raw"]].astype(int)
+    num = ["modis_terra", "modis_aqua", "modis_raw", "viirs_raw"]
+    g[num] = g[num].astype(int)
     OUT.parent.mkdir(exist_ok=True)
     g.to_csv(OUT, index=False)
     print(f"Wrote {OUT}: {len(g):,} cell-months, {g.year.min()}-{g.year.max()}, "
-          f"MODIS={g.modis_raw.sum():,} VIIRS={g.viirs_raw.sum():,}")
+          f"MODIS={g.modis_raw.sum():,} (Terra {g.modis_terra.sum():,}, Aqua {g.modis_aqua.sum():,}) VIIRS={g.viirs_raw.sum():,}")
 
 
 if __name__ == "__main__":
