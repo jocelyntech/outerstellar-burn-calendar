@@ -12,7 +12,7 @@
 
 Built by **Team Outerstellar** for the **2026 NASA Space Apps Challenge**, challenge *"Harmonization of MODIS and VIIRS Hot Spots"*.
 
-> 🔗 **Live app:** _add your Streamlit Community Cloud link here_
+> 🔗 **Live app:** https://outerstellar-burn-calendar.streamlit.app/ 
 
 ---
 
