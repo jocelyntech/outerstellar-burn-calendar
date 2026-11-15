@@ -164,16 +164,26 @@ def loyo_error(df, method="seasonal", min_modis=5):
     e = pd.concat(errs) if errs else pd.Series(dtype=float)
     return (float(e.median()), float(e.quantile(0.8))) if len(e) else (np.nan, np.nan)
 
-def add_uncertainty(df, err, err_terra=0.0):
+def add_uncertainty(df, err, err_terra=0.0, err_robust=None, err_terra_robust=None):
     """+/- band: `err` on VIIRS-harmonized months, `err_terra` on Terra-only months scaled to Terra+Aqua.
-    Months measured directly by MODIS Terra+Aqua get no band."""
+    Months measured directly by MODIS Terra+Aqua get no band.
+
+    The displayed band (hotspot_lo/hi) uses the typical (median) error. The robustness test in analyze() uses a
+    wider band (robust_lo/hi, built from `err_robust` / `err_terra_robust`, e.g. the 80th-percentile error), so a
+    flag only counts as robust if it survives a pessimistic harmonization error. Defaults to the typical error."""
+    err_robust = err if err_robust is None else err_robust
+    err_terra_robust = err_terra if err_terra_robust is None else err_terra_robust
     src = df.sensor_source.astype(str)
-    e = np.where(src.str.startswith("VIIRS"), err, np.where(src.str.startswith("MODIS Terra ("), err_terra, 0.0))
-    return df.assign(err=e, hotspot_lo=df.hotspot_count * (1 - e), hotspot_hi=df.hotspot_count * (1 + e))
+    is_v, is_t = src.str.startswith("VIIRS"), src.str.startswith("MODIS Terra (")
+    e = np.where(is_v, err, np.where(is_t, err_terra, 0.0))
+    er = np.where(is_v, err_robust, np.where(is_t, err_terra_robust, 0.0))
+    return df.assign(err=e, hotspot_lo=df.hotspot_count * (1 - e), hotspot_hi=df.hotspot_count * (1 + e),
+                     robust_lo=df.hotspot_count * (1 - er), robust_hi=df.hotspot_count * (1 + er))
 
 
-def terra_scale_error(df, min_count=5):
-    """Leave-one-year-out error of scaling Terra-only to Terra+Aqua over the Aqua era (NaN if not applicable)."""
+def terra_scale_error(df, min_count=5, q=0.5):
+    """Leave-one-year-out error (quantile `q`, default median) of scaling Terra-only to Terra+Aqua over the
+    Aqua era (NaN if not applicable)."""
     if not {"modis_terra", "modis_aqua"}.issubset(df.columns) or not (df.modis_aqua > 0).any():
         return np.nan
     idx = df.year * 12 + df.month
@@ -188,7 +198,7 @@ def terra_scale_error(df, min_count=5):
         keep = actual >= min_count
         errs.append(((te.modis_terra * k - actual).abs() / actual)[keep])
     e = pd.concat(errs) if errs else pd.Series(dtype=float)
-    return float(e.median()) if len(e) else np.nan
+    return float(e.quantile(q)) if len(e) else np.nan
 
 
 def loyo_error_levels(df, method="seasonal", min_modis=5):
@@ -253,7 +263,7 @@ def analyze(df, mode="fixed", b0=2001, b1=2020, window=10, scale="raw", k=1.5, m
     mode='rolling' : reference = same calendar month in the `window` years BEFORE each month
                      (needs >= min_years of history, otherwise the month is 'no baseline')
     severity: normal / high (> Q3+1.5*IQR) / extreme (> Q3+3*IQR) / low (< Q1-1.5*IQR), on raw or log scale.
-    robust : the flag still holds at the unfavourable end of the harmonization error band.
+    robust : the flag still holds at the unfavourable end of the (80th-percentile) harmonization error band.
     """
     tf = np.log1p if scale == "log" else (lambda a: np.asarray(a, dtype=float))
     df = df.sort_values(["year", "month"]).reset_index(drop=True).copy()
@@ -262,7 +272,8 @@ def analyze(df, mode="fixed", b0=2001, b1=2020, window=10, scale="raw", k=1.5, m
     sev = np.array(["no baseline"] * n, dtype=object)
     robust = np.zeros(n, dtype=bool)
     need = 3 if mode == "fixed" else min_years
-    hc, lo, hi = (df[c].to_numpy(float) for c in ("hotspot_count", "hotspot_lo", "hotspot_hi"))
+    lo_c, hi_c = ("robust_lo", "robust_hi") if "robust_lo" in df.columns else ("hotspot_lo", "hotspot_hi")
+    hc, lo, hi = (df[c].to_numpy(float) for c in ("hotspot_count", lo_c, hi_c))
     yrs, mos = df.year.to_numpy(), df.month.to_numpy()
     for i in range(n):
         yr_ok = (yrs >= b0) & (yrs <= b1) if mode == "fixed" else (yrs >= yrs[i] - window) & (yrs < yrs[i])

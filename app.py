@@ -406,8 +406,10 @@ def main():
                    "Add that file (made by `build_grid_from_firms.py` from FIRMS archive downloads) to use real detections.")
 
     last_y = int(grid.year.max())
-    st.caption(f"Data through **{MONTH_NAMES[int(grid[grid.year == last_y].month.max()) - 1]} {last_y}** "
-               "(NASA FIRMS archive: MODIS C6.1 and Suomi-NPP VIIRS C2, Indonesia + Malaysia)." if not is_mock else "")
+    last_mo = int(grid[grid.year == last_y].month.max())
+    src_countries = " + ".join(sorted(grid.country.unique())) if "country" in grid.columns else "all"
+    st.caption(f"Data through **{MONTH_NAMES[last_mo - 1]} {last_y}** "
+               f"(NASA FIRMS archive: MODIS C6.1 and Suomi-NPP VIIRS C2, {src_countries})." if not is_mock else "")
     preset, bbox, method, scale, (bmode, (b0, b1), window), (sel_year, sel_month), (y0, y1) = sidebar_controls(grid)
     st.sidebar.header("4. Display")
     if st.sidebar.checkbox("Colour-blind-safe palette", help="Swaps the red/blue ramps for cividis / purple-orange."):
@@ -424,10 +426,12 @@ def main():
     harmonized = harmonize(monthly_raw, method)
     med_err, p80_err = loyo_error(harmonized, method)
     err_ta = terra_scale_error(harmonized)
+    err_ta80 = terra_scale_error(harmonized, q=0.8)
     levels = loyo_error_levels(harmonized, method)
     by_size = loyo_error_by_size(harmonized, method)
-    harmonized = add_uncertainty(harmonized, 0 if np.isnan(med_err) else med_err,
-                                 0 if np.isnan(err_ta) else err_ta)
+    nz = lambda x: 0.0 if pd.isna(x) else float(x)
+    harmonized = add_uncertainty(harmonized, nz(med_err), nz(err_ta),
+                                 err_robust=nz(p80_err), err_terra_robust=nz(err_ta80))
     has_cov = (not is_mock) and COVERAGE_CSV.exists()
     if has_cov:
         harmonized = attach_coverage(harmonized, pd.read_csv(COVERAGE_CSV))
@@ -436,9 +440,13 @@ def main():
         full["robust"] = full.robust & ~full.data_gap
     base_desc = (f"the same month in the previous {window} years (needs at least 7)" if bmode == "rolling"
                  else f"the same month in {b0}-{b1}")
-    # partial-month guard: the current UTC month is incomplete, so never flag it
+    # partial-month guard: never flag (a) the current UTC month, or (b) the newest month in the data when the
+    # coverage check shows the satellite(s) reported on < 90% of its days (e.g. a top-up that stops mid-month)
     now = pd.Timestamp.now(tz="UTC")
     partial = (full.year == now.year) & (full.month == now.month)
+    if has_cov:
+        ym = full.year * 12 + full.month
+        partial = partial | ((ym == ym.max()) & full.data_gap.fillna(False).astype(bool))
     full.loc[partial, ["anomaly_flag", "severity"]] = "normal"
     full["partial"] = partial
     view = full[full.year.between(y0, y1)]
@@ -455,10 +463,10 @@ def main():
         pc = r.pctile if pd.notna(r.pctile) else np.nan
         if r.anomaly_flag == "extreme":
             st.error(f"**EXTREME burning activity** for {MONTH_NAMES[sel_month - 1]} {sel_year}"
-                     + (" \u2013 the flag holds even at the unfavourable end of the harmonization error." if r.robust else "."))
+                     + (" \u2013 the flag holds even with a pessimistic (80th-percentile) harmonization error." if r.robust else "."))
         elif r.anomaly_flag == "high":
             st.warning(f"**HIGH burning activity** for {MONTH_NAMES[sel_month - 1]} {sel_year}"
-                       + (" \u2013 the flag holds even at the unfavourable end of the harmonization error." if r.robust else "."))
+                       + (" \u2013 the flag holds even with a pessimistic (80th-percentile) harmonization error." if r.robust else "."))
         elif r.anomaly_flag == "low":
             st.info(f"**Unusually LOW burning activity** for {MONTH_NAMES[sel_month - 1]} {sel_year}.")
         elif r.anomaly_flag == "normal" and pd.notna(pc) and pc >= 85:
@@ -620,17 +628,20 @@ def main():
             "- **Baseline:** *Rolling* compares each month with the same calendar month in the previous N years "
             "(default 10); *Fixed* uses one set of years. Flags: *high* above Q3 + 1.5×IQR, *extreme* above "
             "Q3 + 3×IQR, *low* below Q1 − 1.5×IQR, optionally on a log scale so quiet months can be flagged too. "
-            "*Robust* means the flag still holds at the unfavourable end of the harmonization error band.\n"
+            "*Robust* means the flag still holds after shifting the count by the 80th-percentile harmonization "
+            f"error (≈{p80_err:.0%} here; the shaded band in the charts shows the typical, median error).\n"
             "- **Consistency:** MODIS = Terra + Aqua (Aqua starts July 2002; earlier Terra-only months are scaled "
             "to Terra+Aqua per calendar month), VIIRS = Suomi-NPP only, low-confidence detections removed. "
             "VIIRS (13:30 overpass) agrees better with Terra+Aqua than with Terra alone (10:30).\n"
             "- **Limits:** counts are detections, not burned area; cloud/smoke and overpass time affect detection; "
             "a hotspot count ratio (*k*) assumes similar fire sizes between sensors.\n"
+            "- **Orbit drift:** MODIS on Terra and Aqua can drift from its original overpass time in the 2020s, which "
+            "may shift detection rates; treat comparisons of recent years with early years with extra care.\n"
             "- **Sensors:** VIIRS is Suomi-NPP only, kept for one consistent sensor; adding NOAA-20/21 would raise "
             "later-year counts. *k* is not perfectly constant (see the stability check above).\n"
             "- **Coverage:** FIRMS files were cut by country polygon (Indonesia, Malaysia), so Brunei, Timor-Leste and "
-            "other neighbours are not counted; Borneo totals are slightly low. Data end 31 Oct 2026; "
-            "near-real-time top-up is future work.")
+            "other neighbours are not counted; Borneo totals are slightly low. "
+            f"Data end {MONTH_NAMES[last_mo - 1]} {last_y}; near-real-time top-up is future work.")
 
 
 if __name__ == "__main__":
